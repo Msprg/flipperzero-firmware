@@ -88,6 +88,7 @@ typedef enum {
     FuriHalNfcTechIso14443b, /**< Configure NFC HAL to use the ISO14443 (type B) technology. */
     FuriHalNfcTechIso15693, /**< Configure NFC HAL to use the ISO15693 technology. */
     FuriHalNfcTechFelica, /**< Configure NFC HAL to use the FeliCa technology. */
+    FuriHalNfcTechLegic, /**< Configure NFC HAL to use the LEGIC Prime technology. */
 
     FuriHalNfcTechNum, /**< Special value equal to the supported technologies count. Internal use. */
     FuriHalNfcTechInvalid, /**< Special value indicating the unconfigured state. Internal use. */
@@ -470,6 +471,37 @@ FuriHalNfcError furi_hal_nfc_felica_listener_set_sensf_res_data(
     const uint8_t* pmm,
     const uint8_t pmm_len,
     const uint16_t sys_code);
+
+/**
+ * @brief Get the time the last LEGIC Prime reader frame ended.
+ *
+ * LEGIC Prime tags advance their keystream every ~99.1 µs while idle, so the
+ * poller schedules each frame relative to the previous one.
+ *
+ * @returns DWT cycle count at the end of the closing pause of the last frame.
+ */
+uint32_t furi_hal_nfc_legic_poller_get_frame_end(void);
+
+/**
+ * @brief Set when the next LEGIC Prime reader frame starts.
+ *
+ * @param[in] dwt_cycles DWT cycle count of the first pause, or 0 to transmit immediately.
+ */
+void furi_hal_nfc_legic_poller_set_tx_start(uint32_t dwt_cycles);
+
+/**
+ * @brief Set the length of the tag reply expected for the next frame.
+ *
+ * @param[in] bits number of reply bits, 0 if no reply is expected.
+ */
+void furi_hal_nfc_legic_poller_set_rx_bits(size_t bits);
+
+/**
+ * @brief Use reduced receiver gain for the next LEGIC Prime exchanges.
+ *
+ * @param[in] reduced true for reduced gain (retry setting), false for full gain.
+ */
+void furi_hal_nfc_legic_poller_set_rx_reduced_gain(bool reduced);
 
 #ifdef __cplusplus
 }

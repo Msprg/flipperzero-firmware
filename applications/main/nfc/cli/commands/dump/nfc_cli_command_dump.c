@@ -16,6 +16,7 @@
 #include "protocols/slix/nfc_cli_dump_slix.h"
 #include "protocols/st25tb/nfc_cli_dump_st25tb.h"
 #include "protocols/felica/nfc_cli_dump_felica.h"
+#include "protocols/legic_prime/nfc_cli_dump_legic_prime.h"
 
 #include <datetime.h>
 #include <furi_hal_rtc.h>
@@ -48,6 +49,7 @@ static NfcCliActionContext* nfc_cli_dump_alloc_ctx(Nfc* nfc) {
     instance->sem_done = furi_semaphore_alloc(1, 0);
     instance->nfc_device = nfc_device_alloc();
     instance->desired_protocol = NfcProtocolInvalid;
+    instance->result = NfcCliDumpErrorFailedToRead;
     instance->auth_ctx.skip_auth = true;
     instance->auth_ctx.key_size = 0;
     instance->timeout = NFC_CLI_DUMP_DEFAULT_TIMEOUT;
@@ -93,6 +95,7 @@ NfcGenericCallback protocol_poller_callbacks[NfcProtocolNum] = {
     [NfcProtocolMfDesfire] = nfc_cli_dump_poller_callback_mf_desfire,
     [NfcProtocolMfPlus] = nfc_cli_dump_poller_callback_mf_plus,
     [NfcProtocolSt25tb] = nfc_cli_dump_poller_callback_st25tb,
+    [NfcProtocolLegicPrime] = nfc_cli_dump_poller_callback_legic_prime,
 };
 
 static void nfc_cli_dump_generate_filename(FuriString* file_path) {
@@ -219,6 +222,7 @@ static const NfcProtocolNameValuePair supported_protocols[] = {
     {.name = "des", .value = NfcProtocolMfDesfire},
     {.name = "slix", .value = NfcProtocolSlix},
     {.name = "st25", .value = NfcProtocolSt25tb},
+    {.name = "legic", .value = NfcProtocolLegicPrime},
 };
 
 static bool nfc_cli_dump_parse_protocol(FuriString* value, void* output) {

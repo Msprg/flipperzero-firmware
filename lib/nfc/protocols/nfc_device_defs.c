@@ -24,6 +24,7 @@
 #include <nfc/protocols/mf_desfire/mf_desfire.h>
 #include <nfc/protocols/slix/slix_device_defs.h>
 #include <nfc/protocols/st25tb/st25tb.h>
+#include <nfc/protocols/legic_prime/legic_prime_device_defs.h>
 
 /**
  * @brief List of registered NFC device implementations.
@@ -44,5 +45,6 @@ const NfcDeviceBase* const nfc_devices[NfcProtocolNum] = {
     [NfcProtocolMfDesfire] = &nfc_device_mf_desfire,
     [NfcProtocolSlix] = &nfc_device_slix,
     [NfcProtocolSt25tb] = &nfc_device_st25tb,
+    [NfcProtocolLegicPrime] = &nfc_device_legic_prime,
     /* Add new protocols here */
 };
