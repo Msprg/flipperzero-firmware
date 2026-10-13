@@ -503,6 +503,27 @@ void furi_hal_nfc_legic_poller_set_rx_bits(size_t bits);
  */
 void furi_hal_nfc_legic_poller_set_rx_reduced_gain(bool reduced);
 
+/**
+ * @brief Get when the last received LEGIC Prime reader frame started (first pause).
+ *
+ * @returns DWT cycle count.
+ */
+uint32_t furi_hal_nfc_legic_listener_get_frame_start(void);
+
+/**
+ * @brief Get when the last received LEGIC Prime reader frame ended (closing pause end).
+ *
+ * @returns DWT cycle count.
+ */
+uint32_t furi_hal_nfc_legic_listener_get_frame_end(void);
+
+/**
+ * @brief Get when the last LEGIC Prime tag reply ended.
+ *
+ * @returns DWT cycle count.
+ */
+uint32_t furi_hal_nfc_legic_listener_get_tx_end(void);
+
 #ifdef __cplusplus
 }
 #endif

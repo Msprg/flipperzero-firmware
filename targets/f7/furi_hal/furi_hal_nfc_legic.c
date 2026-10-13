@@ -29,8 +29,10 @@
 #include "furi_hal_nfc_i.h"
 #include "furi_hal_nfc_tech_i.h"
 
+#include <stdarg.h>
 #include <furi.h>
 #include <furi_hal_cortex.h>
+#include <furi_hal_resources.h>
 #include <storage/storage.h>
 
 #define TAG "FuriHalLegic"
@@ -571,6 +573,365 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_rx(
 }
 
 
+/*
+ * Listener (tag emulation).
+ *
+ * Target mode + transparent mode, as in the ISO15693 listener: the chip's IRQ
+ * pin then carries the demodulated field (high during a reader pause) and
+ * MOSI drives load modulation.  Reader frames are decoded from EXTI edge
+ * timestamps; replies are a 212 kHz subcarrier bit-banged on MOSI by the
+ * CPU (cycle-counter deadlines, interrupts off), started 330 µs after the
+ * reader's closing pause.  digital_sequence was tried first: its ~130 µs
+ * DMA prefill latency is longer than the time left after decoding a frame.
+ */
+#define LEGIC_EMU_DBG_LOG_PATH "/ext/legic_emu_dbg.log"
+
+#define LEGIC_LISTENER_EDGES         (256U)
+// A frame is over once no pause follows within the longest bit (99 µs).
+#define LEGIC_LISTENER_FRAME_GAP_US  (120U)
+#define LEGIC_LISTENER_MAX_FRAME_US  (4000U)
+#define LEGIC_LISTENER_MAX_PAUSES    (32U)
+// Reader bit = pause-to-pause interval: '0' ≈ 61 µs, '1' ≈ 99 µs.
+#define LEGIC_LISTENER_BIT_MIN_US    (25U)
+#define LEGIC_LISTENER_BIT_SPLIT_US  (80U)
+#define LEGIC_LISTENER_BIT_MAX_US    (150U)
+// Reader pauses read 12-14 µs high on the IRQ pin; shorter pulses are glitches
+// (seen ~34 µs into the first bit of frames following our reply).
+#define LEGIC_LISTENER_PAUSE_MIN_US  (7U)
+// A second full-width "pause" sometimes shows up ~34 µs into the first bit of
+// a frame; no real bit is shorter than ~59 µs, so drop pauses that follow the
+// previous one too closely.
+#define LEGIC_LISTENER_PAUSE_GAP_MIN_US (45U)
+#define LEGIC_SUBCARRIER_HALVES (42U) // 21 subcarrier cycles per 99.1 µs bit
+
+// Reply start relative to the nominal 330 µs.  Measured against the PM3
+// reader (`hf legic dump`): -15..-25 µs works, 0 and -35 do not.  The PM3
+// samples on a 100 µs grid while tag bits are 99.1 µs, and our frame-end
+// timestamp (falling edge of the last pause on the IRQ pin) lags the field.
+#define LEGIC_LISTENER_TX_OFFSET_US (-20)
+
+typedef struct {
+    volatile uint32_t edge_t[LEGIC_LISTENER_EDGES];
+    volatile uint8_t edge_level[LEGIC_LISTENER_EDGES];
+    volatile uint32_t edge_head;
+    uint32_t edge_tail;
+    volatile bool notified;
+    FuriThreadId thread;
+
+    uint8_t rx_data[4];
+    size_t rx_bits;
+    uint32_t t_frame_start;
+    uint32_t t_frame_end;
+    uint32_t t_tx_end;
+    uint32_t t_decoded;
+    // Last frame's decode details, formatted into dbg_buf outside the
+    // timing-critical path.
+    bool dbg_pending;
+    uint32_t dbg_edges;
+    uint8_t dbg_pauses;
+    int16_t dbg_high_avg_us;
+    uint8_t dbg_d_us[LEGIC_LISTENER_MAX_PAUSES];
+    const char* dbg_result;
+
+    char dbg_buf[6144];
+    size_t dbg_len;
+} FuriHalNfcLegicListener;
+
+static FuriHalNfcLegicListener* furi_hal_nfc_legic_listener = NULL;
+
+static void legic_listener_dbg(FuriHalNfcLegicListener* l, const char* fmt, ...) {
+    if(sizeof(l->dbg_buf) - l->dbg_len < 128) return;
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(l->dbg_buf + l->dbg_len, sizeof(l->dbg_buf) - l->dbg_len, fmt, args);
+    va_end(args);
+    if(n > 0 && (size_t)n < sizeof(l->dbg_buf) - l->dbg_len) l->dbg_len += n;
+}
+
+static void furi_hal_nfc_legic_listener_edge_isr(void* context) {
+    FuriHalNfcLegicListener* l = context;
+    const uint32_t now = DWT->CYCCNT;
+    const uint32_t i = l->edge_head;
+    l->edge_t[i % LEGIC_LISTENER_EDGES] = now;
+    l->edge_level[i % LEGIC_LISTENER_EDGES] = furi_hal_gpio_read(&gpio_nfc_irq_rfid_pull);
+    l->edge_head = i + 1;
+    if(!l->notified && l->thread) {
+        l->notified = true;
+        furi_thread_flags_set(l->thread, FuriHalNfcEventInternalTypeTransparentDataReceived);
+    }
+}
+
+static FuriHalNfcError furi_hal_nfc_legic_listener_init(const FuriHalSpiBusHandle* handle) {
+    furi_check(furi_hal_nfc_legic_listener == NULL);
+
+    FuriHalNfcLegicListener* l = malloc(sizeof(FuriHalNfcLegicListener));
+    memset(l, 0, sizeof(FuriHalNfcLegicListener));
+    furi_hal_nfc_legic_listener = l;
+
+    // Passive target, as the ISO15693 listener.
+    st25r3916_change_reg_bits(
+        handle,
+        ST25R3916_REG_MODE,
+        ST25R3916_REG_MODE_om_mask | ST25R3916_REG_MODE_tr_am,
+        ST25R3916_REG_MODE_om_targ_nfca | ST25R3916_REG_MODE_tr_am_ook);
+    st25r3916_change_reg_bits(
+        handle,
+        ST25R3916_REG_OP_CONTROL,
+        ST25R3916_REG_OP_CONTROL_rx_en,
+        ST25R3916_REG_OP_CONTROL_rx_en);
+    st25r3916_change_reg_bits(
+        handle, ST25R3916_REG_MODE, ST25R3916_REG_MODE_targ, ST25R3916_REG_MODE_targ_targ);
+    FuriHalNfcError error = furi_hal_nfc_legic_common_init(handle);
+
+    // Transparent mode: IRQ pin = demodulated field, MOSI = load modulation.
+    st25r3916_direct_cmd(handle, ST25R3916_CMD_TRANSPARENT_MODE);
+    furi_hal_spi_bus_handle_deinit(handle);
+    furi_hal_nfc_deinit_gpio_isr();
+
+    furi_hal_gpio_write(&gpio_spi_r_mosi, false);
+    furi_hal_gpio_init(&gpio_spi_r_mosi, GpioModeOutputPushPull, GpioPullNo, GpioSpeedVeryHigh);
+    furi_hal_gpio_init(
+        &gpio_nfc_irq_rfid_pull, GpioModeInterruptRiseFall, GpioPullDown, GpioSpeedVeryHigh);
+    furi_hal_gpio_add_int_callback(
+        &gpio_nfc_irq_rfid_pull, furi_hal_nfc_legic_listener_edge_isr, l);
+    furi_hal_gpio_enable_int_callback(&gpio_nfc_irq_rfid_pull);
+
+    return error;
+}
+
+static FuriHalNfcError furi_hal_nfc_legic_listener_deinit(const FuriHalSpiBusHandle* handle) {
+    FuriHalNfcLegicListener* l = furi_hal_nfc_legic_listener;
+    furi_check(l);
+
+    furi_hal_gpio_remove_int_callback(&gpio_nfc_irq_rfid_pull);
+    furi_hal_nfc_init_gpio_isr();
+    furi_hal_spi_bus_handle_init(handle);
+    st25r3916_direct_cmd(handle, ST25R3916_CMD_UNMASK_RECEIVE_DATA);
+
+    if(l->dbg_len) {
+        Storage* storage = furi_record_open(RECORD_STORAGE);
+        File* file = storage_file_alloc(storage);
+        if(storage_file_open(file, LEGIC_EMU_DBG_LOG_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
+            storage_file_write(file, l->dbg_buf, l->dbg_len);
+        }
+        storage_file_close(file);
+        storage_file_free(file);
+        furi_record_close(RECORD_STORAGE);
+    }
+
+    free(l);
+    furi_hal_nfc_legic_listener = NULL;
+
+    return FuriHalNfcErrorNone;
+}
+
+uint32_t furi_hal_nfc_legic_listener_get_frame_start(void) {
+    furi_check(furi_hal_nfc_legic_listener);
+    return furi_hal_nfc_legic_listener->t_frame_start;
+}
+
+uint32_t furi_hal_nfc_legic_listener_get_frame_end(void) {
+    furi_check(furi_hal_nfc_legic_listener);
+    return furi_hal_nfc_legic_listener->t_frame_end;
+}
+
+uint32_t furi_hal_nfc_legic_listener_get_tx_end(void) {
+    furi_check(furi_hal_nfc_legic_listener);
+    return furi_hal_nfc_legic_listener->t_tx_end;
+}
+
+static void furi_hal_nfc_legic_listener_dbg_flush_frame(FuriHalNfcLegicListener* l) {
+    if(!l->dbg_pending) return;
+    l->dbg_pending = false;
+    legic_listener_dbg(
+        l, "rx edges=%lu pauses=%u high_avg_us=%d d_us:", l->dbg_edges, l->dbg_pauses,
+        l->dbg_high_avg_us);
+    for(size_t k = 1; k < l->dbg_pauses && k < LEGIC_LISTENER_MAX_PAUSES; k++) {
+        legic_listener_dbg(l, " %u", l->dbg_d_us[k]);
+    }
+    legic_listener_dbg(
+        l, " -> %s bits=%u val=%02X%02X%02X\n", l->dbg_result, l->rx_bits, l->rx_data[2],
+        l->rx_data[1], l->rx_data[0]);
+}
+
+// Decode one reader frame from the edges in [edge_tail, head).  Runs between
+// the end of the reader frame and our reply, so no formatting here.
+static bool furi_hal_nfc_legic_listener_decode(FuriHalNfcLegicListener* l, uint32_t head) {
+    const int32_t mhz = furi_hal_cortex_instructions_per_microsecond();
+    uint32_t tail = l->edge_tail;
+    if(head - tail > LEGIC_LISTENER_EDGES) tail = head - LEGIC_LISTENER_EDGES;
+    l->edge_tail = head;
+
+    uint32_t starts[LEGIC_LISTENER_MAX_PAUSES];
+    size_t n_starts = 0;
+    uint32_t last_fall = 0;
+    bool have_fall = false;
+    int32_t high_us_sum = 0;
+    uint32_t rise = 0;
+    bool in_pause = false;
+    for(uint32_t i = tail; i < head; i++) {
+        const uint32_t t = l->edge_t[i % LEGIC_LISTENER_EDGES];
+        if(l->edge_level[i % LEGIC_LISTENER_EDGES]) {
+            rise = t;
+            in_pause = true;
+        } else if(in_pause) {
+            in_pause = false;
+            const int32_t width_us = (int32_t)(t - rise) / mhz;
+            if(width_us < (int32_t)LEGIC_LISTENER_PAUSE_MIN_US) continue;
+            if(n_starts &&
+               (int32_t)(rise - starts[n_starts - 1]) / mhz <
+                   (int32_t)LEGIC_LISTENER_PAUSE_GAP_MIN_US) {
+                continue;
+            }
+            if(n_starts < LEGIC_LISTENER_MAX_PAUSES) starts[n_starts++] = rise;
+            high_us_sum += width_us;
+            last_fall = t;
+            have_fall = true;
+        }
+    }
+
+    l->dbg_pending = true;
+    l->dbg_edges = head - tail;
+    l->dbg_pauses = n_starts;
+    l->dbg_high_avg_us = n_starts ? high_us_sum / (int32_t)n_starts : 0;
+    l->dbg_result = "ok";
+    memset(l->rx_data, 0, sizeof(l->rx_data));
+    l->rx_bits = 0;
+
+    if(n_starts < 2) {
+        l->dbg_result = "ignored";
+        return false;
+    }
+
+    for(size_t k = 1; k < n_starts; k++) {
+        const int32_t d_us = (int32_t)(starts[k] - starts[k - 1]) / mhz;
+        l->dbg_d_us[k] = d_us > 255 ? 255 : (d_us < 0 ? 0 : d_us);
+        if(d_us < (int32_t)LEGIC_LISTENER_BIT_MIN_US || d_us > (int32_t)LEGIC_LISTENER_BIT_MAX_US ||
+           l->rx_bits >= sizeof(l->rx_data) * BITS_IN_BYTE) {
+            l->dbg_result = "code violation";
+            return false;
+        }
+        if(d_us > (int32_t)LEGIC_LISTENER_BIT_SPLIT_US) {
+            l->rx_data[l->rx_bits / BITS_IN_BYTE] |= 1u << (l->rx_bits % BITS_IN_BYTE);
+        }
+        l->rx_bits++;
+    }
+
+    l->t_frame_start = starts[0];
+    l->t_frame_end = have_fall ? last_fall :
+                                 starts[n_starts - 1] + legic_chips_to_cycles(LEGIC_PAUSE_CHIP_BITS);
+    return true;
+}
+
+static FuriHalNfcEvent furi_hal_nfc_legic_listener_wait_event(uint32_t timeout_ms) {
+    FuriHalNfcLegicListener* l = furi_hal_nfc_legic_listener;
+    const uint32_t mhz = furi_hal_cortex_instructions_per_microsecond();
+    l->thread = furi_thread_get_current_id();
+
+    while(true) {
+        furi_hal_nfc_legic_listener_dbg_flush_frame(l);
+        uint32_t flag = furi_thread_flags_wait(
+            FuriHalNfcEventInternalTypeAbort | FuriHalNfcEventInternalTypeTransparentDataReceived,
+            FuriFlagWaitAny,
+            timeout_ms);
+        if(flag & FuriFlagError) return FuriHalNfcEventTimeout;
+        furi_thread_flags_clear(flag);
+        if(flag & FuriHalNfcEventInternalTypeAbort) return FuriHalNfcEventAbortRequest;
+
+        // A frame started: wait until the line has been quiet for a while.
+        const uint32_t t_begin = DWT->CYCCNT;
+        while(true) {
+            const uint32_t head = l->edge_head;
+            const uint32_t now = DWT->CYCCNT;
+            const uint32_t last = head ? l->edge_t[(head - 1) % LEGIC_LISTENER_EDGES] : t_begin;
+            if(now - last > LEGIC_LISTENER_FRAME_GAP_US * mhz) break;
+            if(now - t_begin > LEGIC_LISTENER_MAX_FRAME_US * mhz) break;
+        }
+        l->notified = false;
+        if(furi_hal_nfc_legic_listener_decode(l, l->edge_head)) {
+            l->t_decoded = DWT->CYCCNT;
+            return FuriHalNfcEventRxEnd;
+        }
+    }
+}
+
+static FuriHalNfcError furi_hal_nfc_legic_listener_tx(
+    const FuriHalSpiBusHandle* handle,
+    const uint8_t* tx_data,
+    size_t tx_bits) {
+    UNUSED(handle);
+    FuriHalNfcLegicListener* l = furi_hal_nfc_legic_listener;
+    const uint32_t mhz = furi_hal_cortex_instructions_per_microsecond();
+    const uint32_t t_entry = DWT->CYCCNT;
+
+    // Reply starts 330 µs after the end of the reader's closing pause.
+    const uint32_t start = l->t_frame_end + legic_chips_to_cycles(LEGIC_TAG_FRAME_WAIT_CHIPS) +
+                           LEGIC_LISTENER_TX_OFFSET_US * (int32_t)mhz;
+    const int32_t wait = (int32_t)(start - DWT->CYCCNT);
+    if(wait > (int32_t)(5U * mhz) && wait < (int32_t)(2000U * mhz)) {
+        while((int32_t)(start - (5U * mhz) - DWT->CYCCNT) > 0) {
+        }
+    }
+
+    // Half-period of the 212 kHz subcarrier (32/fc) in cycles, Q8 fixed point.
+    const uint32_t half_q8 = (uint32_t)(32ULL * 256U * mhz * 1000000ULL / 13560000ULL);
+    const uint32_t t_start = wait > 0 ? start : DWT->CYCCNT;
+    uint32_t acc_q8 = 0;
+    FURI_CRITICAL_ENTER();
+    while((int32_t)(t_start - DWT->CYCCNT) > 0) {
+    }
+    for(size_t i = 0; i < tx_bits; i++) {
+        const bool bit = (tx_data[i / BITS_IN_BYTE] >> (i % BITS_IN_BYTE)) & 1u;
+        for(uint32_t h = 0; h < LEGIC_SUBCARRIER_HALVES; h++) {
+            furi_hal_gpio_write(&gpio_spi_r_mosi, bit && !(h & 1u));
+            acc_q8 += half_q8;
+            const uint32_t next = t_start + (acc_q8 >> 8);
+            while((int32_t)(next - DWT->CYCCNT) > 0) {
+            }
+        }
+    }
+    furi_hal_gpio_write(&gpio_spi_r_mosi, false);
+    FURI_CRITICAL_EXIT();
+    const uint32_t t_done = DWT->CYCCNT;
+    l->t_tx_end = t_start + (acc_q8 >> 8);
+
+    // Drop edges caused by our own load modulation.
+    furi_delay_us(10);
+    l->edge_tail = l->edge_head;
+
+    furi_hal_nfc_legic_listener_dbg_flush_frame(l);
+    legic_listener_dbg(
+        l,
+        "tx bits=%u wait_us=%ld decoded_after_end_us=%ld entry_after_end_us=%ld tx_call_us=%ld val=%02X%02X\n",
+        tx_bits,
+        wait / (int32_t)mhz,
+        (int32_t)(l->t_decoded - l->t_frame_end) / (int32_t)mhz,
+        (int32_t)(t_entry - l->t_frame_end) / (int32_t)mhz,
+        (int32_t)(t_done - t_start) / (int32_t)mhz,
+        tx_data[1],
+        tx_data[0]);
+    return FuriHalNfcErrorNone;
+}
+
+static FuriHalNfcError furi_hal_nfc_legic_listener_rx(
+    const FuriHalSpiBusHandle* handle,
+    uint8_t* rx_data,
+    size_t rx_data_size,
+    size_t* rx_bits) {
+    UNUSED(handle);
+    FuriHalNfcLegicListener* l = furi_hal_nfc_legic_listener;
+    const size_t bytes = (l->rx_bits + 7) / BITS_IN_BYTE;
+    if(bytes > rx_data_size) return FuriHalNfcErrorBufferOverflow;
+    memcpy(rx_data, l->rx_data, bytes);
+    *rx_bits = l->rx_bits;
+    return FuriHalNfcErrorNone;
+}
+
+static FuriHalNfcError furi_hal_nfc_legic_listener_noop(const FuriHalSpiBusHandle* handle) {
+    UNUSED(handle);
+    return FuriHalNfcErrorNone;
+}
+
 const FuriHalNfcTechBase furi_hal_nfc_legic = {
     .poller =
         {
@@ -585,16 +946,15 @@ const FuriHalNfcTechBase furi_hal_nfc_legic = {
             .tx = furi_hal_nfc_legic_poller_tx,
             .rx = furi_hal_nfc_legic_poller_rx,
         },
-    // Listener not implemented.
     .listener =
         {
             .compensation = {0},
-            .init = NULL,
-            .deinit = NULL,
-            .wait_event = NULL,
-            .tx = NULL,
-            .rx = NULL,
-            .sleep = NULL,
-            .idle = NULL,
+            .init = furi_hal_nfc_legic_listener_init,
+            .deinit = furi_hal_nfc_legic_listener_deinit,
+            .wait_event = furi_hal_nfc_legic_listener_wait_event,
+            .tx = furi_hal_nfc_legic_listener_tx,
+            .rx = furi_hal_nfc_legic_listener_rx,
+            .sleep = furi_hal_nfc_legic_listener_noop,
+            .idle = furi_hal_nfc_legic_listener_noop,
         },
 };
