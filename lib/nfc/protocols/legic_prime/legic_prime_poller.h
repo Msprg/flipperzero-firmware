@@ -35,14 +35,14 @@ typedef struct {
     LegicPrimePollerEventData* data;
 } LegicPrimePollerEvent;
 
-/** Run the full setup phase (IV, type, ACK). On success populates the type. */
+/** Detect the tag: send the IV and decode the card type into instance->data. */
 LegicPrimeError legic_prime_poller_setup(LegicPrimePoller* instance, uint8_t iv);
 
-/** Read one byte at the given address. */
-LegicPrimeError
-    legic_prime_poller_read_byte(LegicPrimePoller* instance, uint16_t addr, uint8_t* value);
-
-/** Read the entire memory image into instance->data. */
+/**
+ * Run one read session from a fresh field: handshake, then read every byte
+ * not read yet.  Returns LegicPrimeErrorNone once all bytes are read; any
+ * other error means the session ended early (reset the field and call again).
+ */
 LegicPrimeError legic_prime_poller_read(LegicPrimePoller* instance);
 
 #ifdef __cplusplus

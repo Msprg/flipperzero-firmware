@@ -32,218 +32,262 @@ static LegicPrimeError legic_prime_poller_map_nfc_error(NfcError err) {
  * aim 250 µs + k * 99.1 µs past the reference (±50 µs of margin), with k as
  * small as the software latency allows, and forward k more steps.
  */
-#define LEGIC_PRIME_TAG_FRAME_WAIT_CHIPS (70U) // 330 µs, in 64/fc ticks
-#define LEGIC_PRIME_TAG_BIT_CHIPS        (21U) // 99.1 µs
-#define LEGIC_PRIME_NEXT_FRAME_US        (250U)
-#define LEGIC_PRIME_SCHEDULE_MARGIN_US   (1500U)
+// Failed reads allowed per byte (CRC errors or disagreeing reads); failed
+// bytes are retried in later passes.
+#define LEGIC_PRIME_READ_ATTEMPTS (6U)
 
-// Read attempts per byte; retries alternate the receiver gain.
-#define LEGIC_PRIME_READ_ATTEMPTS (4)
-
-static uint32_t legic_prime_chips_to_cycles(uint32_t chips) {
-    const uint64_t cpu_hz = (uint64_t)furi_hal_cortex_instructions_per_microsecond() * 1000000U;
-    return (uint32_t)(chips * 64U * cpu_hz / 13560000U);
+static uint8_t legic_prime_type_code(LegicPrimeType type) {
+    return type == LegicPrimeTypeMim22 ? 0x0D : type == LegicPrimeTypeMim1024 ? 0x3D : 0x1D;
 }
 
-static void legic_prime_poller_schedule(LegicPrimePoller* instance) {
-    const uint32_t cpu_mhz = furi_hal_cortex_instructions_per_microsecond();
-    const uint32_t bit = legic_prime_chips_to_cycles(LEGIC_PRIME_TAG_BIT_CHIPS);
-
-    uint32_t ref = furi_hal_nfc_legic_poller_get_frame_end();
-    int steps = 2;
-    if(instance->last_reply_bits) {
-        ref += legic_prime_chips_to_cycles(
-            LEGIC_PRIME_TAG_FRAME_WAIT_CHIPS +
-            instance->last_reply_bits * LEGIC_PRIME_TAG_BIT_CHIPS);
-        steps = 3;
-    }
-
-    uint32_t t = ref + LEGIC_PRIME_NEXT_FRAME_US * cpu_mhz;
-    const uint32_t earliest = DWT->CYCCNT + LEGIC_PRIME_SCHEDULE_MARGIN_US * cpu_mhz;
-    while((int32_t)(t - earliest) < 0) {
-        t += bit;
-        steps++;
-    }
-
-    legic_prime_prng_forward(steps);
-    furi_hal_nfc_legic_poller_set_tx_start(t);
+static uint8_t legic_prime_ack_code(LegicPrimeType type) {
+    // Card type | READCMD, as Proxmark armsrc/legicrf.c setup_phase.
+    return type == LegicPrimeTypeMim22 ? 0x19 : 0x39;
 }
 
-/*
- * Send `bits` of `value` (LSB-first on the wire, matching Proxmark's
- * tx_frame loop) XORed with the running keystream, advancing the PRNG by
- * `bits` steps, and receive a reply of `rx_bits` bits (0 = none expected).
- */
-static LegicPrimeError legic_prime_poller_tx_frame(
-    LegicPrimePoller* instance,
-    uint32_t value,
-    uint8_t bits,
-    uint8_t rx_bits) {
-    furi_assert(instance);
-    furi_assert(bits <= 32);
-
-    bit_buffer_reset(instance->tx_buffer);
-
-    for(uint8_t i = 0; i < bits; i++) {
-        bool data_bit = (value >> i) & 1u;
-        bool key_bit = legic_prime_prng_get_bit();
-        bit_buffer_append_bit(instance->tx_buffer, data_bit ^ key_bit);
-        legic_prime_prng_forward(1);
-    }
-
-    furi_hal_nfc_legic_poller_set_rx_bits(rx_bits);
-    instance->last_reply_bits = rx_bits;
-
-    NfcError nerr =
-        nfc_poller_trx(instance->nfc, instance->tx_buffer, instance->rx_buffer, LEGIC_PRIME_FWT_FC);
-    return legic_prime_poller_map_nfc_error(nerr);
-}
-
-/* Decode `bits` of received data into `*out`, XOR-decoding against the
- * keystream and advancing the PRNG by `bits` steps. */
-static void legic_prime_poller_decode_rx(
-    const BitBuffer* rx_buffer,
-    uint8_t bits,
-    uint32_t* out) {
-    uint32_t v = 0;
-    for(uint8_t i = 0; i < bits; i++) {
-        bool rx_bit = false;
-        // BitBuffer stores bits LSB-first in each byte.
-        size_t byte_idx = i / 8;
-        size_t bit_idx = i % 8;
-        if(byte_idx < bit_buffer_get_size_bytes(rx_buffer) ||
-           (byte_idx == bit_buffer_get_size_bytes(rx_buffer) &&
-            bit_buffer_has_partial_byte(rx_buffer))) {
-            uint8_t byte = bit_buffer_get_byte(rx_buffer, byte_idx);
-            rx_bit = (byte >> bit_idx) & 1u;
-        }
-        bool key_bit = legic_prime_prng_get_bit();
-        v |= ((uint32_t)(rx_bit ^ key_bit)) << i;
-        legic_prime_prng_forward(1);
-    }
-    *out = v;
-}
-
-// Mirrors Proxmark armsrc/legicrf.c setup_phase.
-LegicPrimeError legic_prime_poller_setup(LegicPrimePoller* instance, uint8_t iv) {
-    furi_assert(instance);
-
-    // Explicit warmup: hold carrier briefly to fully power the tag before
-    // sending the IV. Proxmark armsrc/legicrf.c uses ~5 ms.
-    furi_delay_ms(5);
-
-
-    // Phase 1: send IV (7 bits) with all-zero keystream, as soon as possible.
-    legic_prime_prng_init(0);
-    furi_hal_nfc_legic_poller_set_tx_start(0);
-    LegicPrimeError ret = legic_prime_poller_tx_frame(instance, iv, 7, 6);
-    if(ret != LegicPrimeErrorNone) return ret;
-
-    // Phase 2: the tag seeds its PRNG with the IV and steps it twice before
-    // the 6-bit card type reply.
-    legic_prime_prng_init(iv);
-    legic_prime_prng_forward(2);
-    uint32_t type_word = 0;
-    legic_prime_poller_decode_rx(instance->rx_buffer, 6, &type_word);
-    uint8_t type_byte = (uint8_t)(type_word & 0x3F);
-
-    uint8_t ack = 0;
-    switch(type_byte) {
-    case 0x0D: // MIM22
-        instance->data->type = LegicPrimeTypeMim22;
+static void legic_prime_poller_set_type(LegicPrimePoller* instance, LegicPrimeType type) {
+    instance->data->type = type;
+    switch(type) {
+    case LegicPrimeTypeMim22:
         instance->data->data_size = LEGIC_PRIME_MEM_SIZE_MIM22;
         instance->cmd_size_bits = 6;
         instance->addr_size_bits = 5;
-        ack = 0x19;
         break;
-    case 0x1D: // MIM256
-        instance->data->type = LegicPrimeTypeMim256;
-        instance->data->data_size = LEGIC_PRIME_MEM_SIZE_MIM256;
-        instance->cmd_size_bits = 9;
-        instance->addr_size_bits = 8;
-        ack = 0x39;
-        break;
-    case 0x3D: // MIM1024
-        instance->data->type = LegicPrimeTypeMim1024;
+    case LegicPrimeTypeMim1024:
         instance->data->data_size = LEGIC_PRIME_MEM_SIZE_MIM1024;
         instance->cmd_size_bits = 11;
         instance->addr_size_bits = 10;
-        ack = 0x39;
         break;
     default:
-        FURI_LOG_E(TAG, "Unknown LEGIC type byte: 0x%02X", type_byte);
-        return LegicPrimeErrorUnknownType;
+        instance->data->data_size = LEGIC_PRIME_MEM_SIZE_MIM256;
+        instance->cmd_size_bits = 9;
+        instance->addr_size_bits = 8;
+        break;
     }
+}
 
-    instance->data->iv = iv;
+static bool legic_prime_type_from_code(uint8_t code, LegicPrimeType* type) {
+    for(LegicPrimeType t = 0; t < LegicPrimeTypeNum; t++) {
+        if(legic_prime_type_code(t) == code) {
+            *type = t;
+            return true;
+        }
+    }
+    return false;
+}
 
-    // Phase 3: ACK in the scheduled slot.  No reply is expected; the FWT
-    // timeout that follows is benign.
-    legic_prime_poller_schedule(instance);
-    ret = legic_prime_poller_tx_frame(instance, ack, 6, 0);
-    if(ret != LegicPrimeErrorNone && ret != LegicPrimeErrorTimeout) return ret;
+/*
+ * Build one reader frame on the running keystream: forward `pre_steps`
+ * (the tag's idle steps since the previous frame or reply: 3 after a reply,
+ * 2 after the ACK, for the ~220 µs gaps the HAL keeps), XOR the frame bits,
+ * then, if a reply is expected, skip the tag's 2 steps and keep the reply's
+ * keystream so the reply can be decoded after later frames were built.
+ */
+static void legic_prime_poller_build(
+    LegicPrimeExchange* ex,
+    uint32_t value,
+    uint8_t bits,
+    uint8_t pre_steps,
+    uint8_t rx_bits) {
+    legic_prime_prng_forward(pre_steps);
+    ex->tx = 0;
+    for(uint8_t i = 0; i < bits; i++) {
+        ex->tx |= (uint32_t)(((value >> i) & 1u) ^ legic_prime_prng_get_bit()) << i;
+        legic_prime_prng_forward(1);
+    }
+    ex->tx_bits = bits;
+    ex->rx_bits = rx_bits;
+    ex->ks = 0;
+    if(rx_bits) {
+        legic_prime_prng_forward(2);
+        for(uint8_t i = 0; i < rx_bits; i++) {
+            ex->ks |= (uint32_t)legic_prime_prng_get_bit() << i;
+            legic_prime_prng_forward(1);
+        }
+    }
+}
 
+static void legic_prime_poller_frame_bytes(const LegicPrimeExchange* ex, uint8_t bytes[4]) {
+    for(size_t i = 0; i < 4; i++) {
+        bytes[i] = (ex->tx >> (8 * i)) & 0xFF;
+    }
+}
+
+static void legic_prime_poller_queue(
+    const LegicPrimeExchange* first,
+    const LegicPrimeExchange* second) {
+    uint8_t a[4];
+    uint8_t b[4];
+    legic_prime_poller_frame_bytes(first, a);
+    if(second) legic_prime_poller_frame_bytes(second, b);
+    furi_hal_nfc_legic_poller_set_next(
+        a,
+        first->tx_bits,
+        second ? b : NULL,
+        second ? second->tx_bits : 0,
+        second ? second->rx_bits : first->rx_bits);
+}
+
+// Send ex (or claim it if the HAL already sent it) and decode its reply.
+static LegicPrimeError
+    legic_prime_poller_exchange(LegicPrimePoller* instance, const LegicPrimeExchange* ex, uint32_t* reply) {
+    bit_buffer_reset(instance->tx_buffer);
+    for(uint8_t i = 0; i < ex->tx_bits; i++) {
+        bit_buffer_append_bit(instance->tx_buffer, (ex->tx >> i) & 1u);
+    }
+    furi_hal_nfc_legic_poller_set_rx_bits(ex->rx_bits);
+
+    NfcError nerr =
+        nfc_poller_trx(instance->nfc, instance->tx_buffer, instance->rx_buffer, LEGIC_PRIME_FWT_FC);
+    if(nerr != NfcErrorNone) return legic_prime_poller_map_nfc_error(nerr);
+
+    uint32_t v = 0;
+    const size_t rx_bits = bit_buffer_get_size(instance->rx_buffer);
+    for(uint8_t i = 0; i < ex->rx_bits; i++) {
+        bool bit = i < rx_bits && ((bit_buffer_get_byte(instance->rx_buffer, i / 8) >> (i % 8)) & 1u);
+        v |= (uint32_t)bit << i;
+    }
+    *reply = v ^ ex->ks;
     return LegicPrimeErrorNone;
 }
 
-// Mirrors Proxmark armsrc/legicrf.c read_byte.
-LegicPrimeError
-    legic_prime_poller_read_byte(LegicPrimePoller* instance, uint16_t addr, uint8_t* value) {
+// The IV frame (plain) and the keystream of the tag's 6-bit type reply.
+static void legic_prime_poller_build_iv(LegicPrimeExchange* ex, uint8_t iv) {
+    ex->tx = iv;
+    ex->tx_bits = 7;
+    ex->rx_bits = 6;
+    ex->ks = 0;
+    legic_prime_prng_init(iv);
+    legic_prime_prng_forward(2);
+    for(uint8_t i = 0; i < 6; i++) {
+        ex->ks |= (uint32_t)legic_prime_prng_get_bit() << i;
+        legic_prime_prng_forward(1);
+    }
+}
+
+// Detection: send the IV and decode the card type.  The tag is then waiting
+// for an ACK, so reset the field before reading.
+LegicPrimeError legic_prime_poller_setup(LegicPrimePoller* instance, uint8_t iv) {
     furi_assert(instance);
-    furi_assert(value);
 
-    legic_prime_poller_schedule(instance);
+    // Hold the carrier briefly to power the tag (Proxmark uses ~5 ms).
+    furi_delay_ms(5);
 
-    // Command: (addr << 1) | READ(=1)
-    uint32_t cmd = (((uint32_t)addr) << 1) | 1u;
-    LegicPrimeError ret = legic_prime_poller_tx_frame(instance, cmd, instance->cmd_size_bits, 12);
+    LegicPrimeExchange iv_ex;
+    legic_prime_poller_build_iv(&iv_ex, iv);
+    uint32_t reply = 0;
+    LegicPrimeError ret = legic_prime_poller_exchange(instance, &iv_ex, &reply);
     if(ret != LegicPrimeErrorNone) return ret;
 
-    // Response is 12 bits = 8-bit data | 4-bit CRC, XOR-encrypted, sent after
-    // the tag steps its PRNG twice.
-    legic_prime_prng_forward(2);
-    uint32_t resp = 0;
-    legic_prime_poller_decode_rx(instance->rx_buffer, 12, &resp);
-
-    uint8_t data_byte = (uint8_t)(resp & 0xFF);
-    uint8_t rx_crc = (uint8_t)((resp >> 8) & 0x0F);
-
-    uint8_t calc_crc = legic_prime_crc4(cmd, instance->cmd_size_bits, data_byte);
-    if(rx_crc != calc_crc) {
-        FURI_LOG_D(
-            TAG,
-            "CRC mismatch at addr %u: got 0x%X expected 0x%X (data 0x%02X)",
-            addr,
-            rx_crc,
-            calc_crc,
-            data_byte);
-        return LegicPrimeErrorWrongCrc;
+    LegicPrimeType type;
+    if(!legic_prime_type_from_code(reply & 0x3F, &type)) {
+        FURI_LOG_E(TAG, "Unknown LEGIC type byte: 0x%02lX", reply & 0x3F);
+        return LegicPrimeErrorUnknownType;
     }
-
-    *value = data_byte;
+    legic_prime_poller_set_type(instance, type);
+    instance->data->iv = iv;
     return LegicPrimeErrorNone;
 }
 
+static bool legic_prime_poller_is_done(const LegicPrimePoller* instance, uint16_t addr) {
+    return instance->done[addr / 8] & (1u << (addr % 8));
+}
+
+// Next address to read after `after`, cycling, `after` itself last.
+static bool legic_prime_poller_next_addr(LegicPrimePoller* instance, uint16_t after, uint16_t* addr) {
+    const uint16_t size = instance->data->data_size;
+    for(uint16_t i = 1; i <= size; i++) {
+        const uint16_t a = (after + i) % size;
+        if(!legic_prime_poller_is_done(instance, a) &&
+           instance->attempts[a] < LEGIC_PRIME_READ_ATTEMPTS) {
+            *addr = a;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * One read session, mirroring Proxmark armsrc/legicrf.c but pipelined: the
+ * ACK and the first READ go out chained behind the type reply, and every
+ * further READ is queued before the previous reply is decoded, so each frame
+ * follows the tag's reply by ~220 µs as real tags require.  Returns
+ * LegicPrimeErrorNone once every byte was read.
+ */
 LegicPrimeError legic_prime_poller_read(LegicPrimePoller* instance) {
     furi_assert(instance);
     furi_assert(instance->data->data_size <= LEGIC_PRIME_MEM_MAX);
 
-    // A CRC error means our decode was wrong; the keystream schedule is
-    // unaffected, so just read the byte again (alternating receiver gain).
-    for(uint16_t addr = instance->read_addr; addr < instance->data->data_size; addr++) {
-        LegicPrimeError ret = LegicPrimeErrorWrongCrc;
-        for(int attempt = 0; attempt < LEGIC_PRIME_READ_ATTEMPTS; attempt++) {
-            furi_hal_nfc_legic_poller_set_rx_reduced_gain(attempt % 2);
-            ret = legic_prime_poller_read_byte(instance, addr, &instance->data->data[addr]);
-            if(ret != LegicPrimeErrorWrongCrc) break;
-        }
-        furi_hal_nfc_legic_poller_set_rx_reduced_gain(false);
-        if(ret != LegicPrimeErrorNone) {
-            FURI_LOG_E(TAG, "Read failed at addr %u: %d", addr, ret);
-            return ret;
-        }
-        instance->read_addr = addr + 1;
+    uint16_t addr;
+    if(!legic_prime_poller_next_addr(instance, instance->data->data_size - 1, &addr)) {
+        return instance->done_count == instance->data->data_size ? LegicPrimeErrorNone :
+                                                                    LegicPrimeErrorWrongCrc;
     }
 
-    return LegicPrimeErrorNone;
+    furi_delay_ms(5);
+
+    const LegicPrimeType type = instance->data->type;
+    LegicPrimeExchange iv_ex, ack, cur, next;
+    legic_prime_prng_init(0);
+    legic_prime_poller_build_iv(&iv_ex, instance->data->iv);
+    legic_prime_poller_build(&ack, legic_prime_ack_code(type), 6, 3, 0);
+    legic_prime_poller_build(&cur, (addr << 1) | 1u, instance->cmd_size_bits, 2, 12);
+    cur.addr = addr;
+    legic_prime_poller_queue(&ack, &cur);
+
+    uint32_t reply = 0;
+    LegicPrimeError ret = legic_prime_poller_exchange(instance, &iv_ex, &reply);
+    if(ret != LegicPrimeErrorNone) return ret;
+    if((reply & 0x3F) != legic_prime_type_code(type)) {
+        // ACK and READ were built for the wrong type; retry with the new one.
+        LegicPrimeType seen;
+        if(legic_prime_type_from_code(reply & 0x3F, &seen)) {
+            FURI_LOG_D(TAG, "Card type 0x%02lX, expected 0x%02X", reply & 0x3F, legic_prime_type_code(type));
+        }
+        return LegicPrimeErrorUnknownType;
+    }
+
+    for(uint32_t budget = instance->data->data_size * LEGIC_PRIME_READ_ATTEMPTS + 16; budget;
+        budget--) {
+        if(!furi_hal_nfc_legic_poller_next_sent()) return LegicPrimeErrorTimeout;
+
+        uint16_t next_addr;
+        const bool have_next = legic_prime_poller_next_addr(instance, cur.addr, &next_addr);
+        if(have_next) {
+            legic_prime_poller_build(
+                &next, (next_addr << 1) | 1u, instance->cmd_size_bits, 3, 12);
+            next.addr = next_addr;
+            legic_prime_poller_queue(&next, NULL);
+        }
+
+        ret = legic_prime_poller_exchange(instance, &cur, &reply);
+        if(ret != LegicPrimeErrorNone) return ret;
+
+        // A 4-bit CRC passes 1 in 16 misdecoded replies, so a byte is only
+        // accepted once two reads (with different keystreams) agree.
+        const uint8_t data = reply & 0xFF;
+        const uint8_t crc = (reply >> 8) & 0x0F;
+        const uint8_t bit = 1u << (cur.addr % 8);
+        if(legic_prime_poller_is_done(instance, cur.addr)) {
+            // Redundant read of an already confirmed byte.
+        } else if(crc == legic_prime_crc4((cur.addr << 1) | 1u, instance->cmd_size_bits, data)) {
+            if((instance->seen[cur.addr / 8] & bit) && instance->data->data[cur.addr] == data) {
+                instance->done[cur.addr / 8] |= bit;
+                instance->done_count++;
+            } else {
+                if(instance->seen[cur.addr / 8] & bit) instance->attempts[cur.addr]++;
+                instance->data->data[cur.addr] = data;
+                instance->seen[cur.addr / 8] |= bit;
+            }
+        } else {
+            instance->attempts[cur.addr]++;
+            FURI_LOG_D(TAG, "CRC mismatch at addr %u", cur.addr);
+        }
+
+        if(instance->done_count == instance->data->data_size) return LegicPrimeErrorNone;
+        if(!have_next) break;
+        cur = next;
+    }
+
+    return LegicPrimeErrorWrongCrc;
 }

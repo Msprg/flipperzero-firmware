@@ -504,6 +504,34 @@ void furi_hal_nfc_legic_poller_set_rx_bits(size_t bits);
 void furi_hal_nfc_legic_poller_set_rx_reduced_gain(bool reduced);
 
 /**
+ * @brief Queue the LEGIC Prime reader frame that follows the next reply.
+ *
+ * Real tags only wait a few 99.1 µs slots for the reader's next frame, so it
+ * is sent from the receive path, ~230 µs after the tag's reply ends, before
+ * the reply is decoded.  The following poller tx() of the same frame then
+ * only waits for its reply.
+ *
+ * @param[in] first first frame, LSB-first bits.
+ * @param[in] first_bits number of bits in the first frame.
+ * @param[in] second optional frame chained ~220 µs after the first (or NULL).
+ * @param[in] second_bits number of bits in the second frame.
+ * @param[in] rx_bits reply length expected after the last frame.
+ */
+void furi_hal_nfc_legic_poller_set_next(
+    const uint8_t* first,
+    size_t first_bits,
+    const uint8_t* second,
+    size_t second_bits,
+    size_t rx_bits);
+
+/**
+ * @brief Check whether the queued LEGIC Prime frame went out in its slot.
+ *
+ * @returns true if it was sent and has not been claimed by tx() yet.
+ */
+bool furi_hal_nfc_legic_poller_next_sent(void);
+
+/**
  * @brief Get when the last received LEGIC Prime reader frame started (first pause).
  *
  * @returns DWT cycle count.

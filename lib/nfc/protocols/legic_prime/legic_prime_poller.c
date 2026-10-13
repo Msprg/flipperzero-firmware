@@ -73,10 +73,15 @@ static NfcCommand legic_prime_poller_request_mode_handler(LegicPrimePoller* inst
     NfcCommand cmd = instance->callback(instance->general_event, instance->context);
     // Only mode currently is Read.
     instance->state = LegicPrimePollerStateRead;
-    instance->read_addr = 0;
+    memset(instance->done, 0, sizeof(instance->done));
+    memset(instance->seen, 0, sizeof(instance->seen));
+    memset(instance->attempts, 0, sizeof(instance->attempts));
+    instance->done_count = 0;
+    instance->resume_done = 0;
     instance->resumes = 0;
-    instance->resume_addr = 0;
-    return cmd;
+    // The tag is waiting for the ACK of the detection handshake; start the
+    // read session from a fresh field.
+    return cmd == NfcCommandContinue ? NfcCommandReset : cmd;
 }
 
 // A tag that misses a frame drops its session and waits for a new IV; a
@@ -87,38 +92,13 @@ static NfcCommand legic_prime_poller_read_handler(LegicPrimePoller* instance) {
     NfcCommand command = NfcCommandContinue;
     LegicPrimeError err = legic_prime_poller_read(instance);
     // Only resumes that make no progress count against the limit.
-    if(instance->read_addr != instance->resume_addr) {
-        instance->resume_addr = instance->read_addr;
+    if(instance->done_count != instance->resume_done) {
+        instance->resume_done = instance->done_count;
         instance->resumes = 0;
     }
     if(err == LegicPrimeErrorNone) {
         instance->state = LegicPrimePollerStateSuccess;
-    } else if(err != LegicPrimeErrorWrongCrc && instance->resumes < LEGIC_PRIME_MAX_RESUMES) {
-        instance->resumes++;
-        instance->state = LegicPrimePollerStateResume;
-        command = NfcCommandReset;
-    } else {
-        instance->state = LegicPrimePollerStateFailure;
-        instance->legic_event_data.error = err;
-    }
-    return command;
-}
-
-static NfcCommand legic_prime_poller_resume_handler(LegicPrimePoller* instance) {
-    NfcCommand command = NfcCommandContinue;
-    const LegicPrimeType type = instance->data->type;
-    const uint16_t data_size = instance->data->data_size;
-    const uint8_t cmd_size_bits = instance->cmd_size_bits;
-    const uint8_t addr_size_bits = instance->addr_size_bits;
-    LegicPrimeError err = legic_prime_poller_setup(instance, instance->data->iv);
-    if(err == LegicPrimeErrorNone && instance->data->type == type) {
-        instance->state = LegicPrimePollerStateRead;
     } else if(instance->resumes < LEGIC_PRIME_MAX_RESUMES) {
-        // Card type must not change mid-read; a different one is a misdecode.
-        instance->data->type = type;
-        instance->data->data_size = data_size;
-        instance->cmd_size_bits = cmd_size_bits;
-        instance->addr_size_bits = addr_size_bits;
         instance->resumes++;
         command = NfcCommandReset;
     } else {
@@ -149,7 +129,6 @@ static LegicPrimePollerStateHandler
         [LegicPrimePollerStateSetup] = legic_prime_poller_setup_handler,
         [LegicPrimePollerStateRequestMode] = legic_prime_poller_request_mode_handler,
         [LegicPrimePollerStateRead] = legic_prime_poller_read_handler,
-        [LegicPrimePollerStateResume] = legic_prime_poller_resume_handler,
         [LegicPrimePollerStateSuccess] = legic_prime_poller_success_handler,
         [LegicPrimePollerStateFailure] = legic_prime_poller_failure_handler,
 };

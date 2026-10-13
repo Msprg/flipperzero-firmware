@@ -590,6 +590,12 @@ FuriHalNfcError furi_hal_nfc_listener_rx(uint8_t* rx_data, size_t rx_data_size, 
 FuriHalNfcError furi_hal_nfc_trx_reset(void) {
     const FuriHalSpiBusHandle* handle = &furi_hal_spi_bus_handle_nfc;
 
+    // LEGIC Prime sends its next frame from the receive path; don't cut it off.
+    if(furi_hal_nfc.mode == FuriHalNfcModePoller && furi_hal_nfc.tech == FuriHalNfcTechLegic &&
+       furi_hal_nfc_legic_poller_tx_in_flight()) {
+        return FuriHalNfcErrorNone;
+    }
+
     st25r3916_direct_cmd(handle, ST25R3916_CMD_STOP);
 
     return FuriHalNfcErrorNone;
