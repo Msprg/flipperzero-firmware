@@ -497,9 +497,12 @@ void furi_hal_nfc_legic_poller_set_tx_start(uint32_t dwt_cycles);
 void furi_hal_nfc_legic_poller_set_rx_bits(size_t bits);
 
 /**
- * @brief Use reduced receiver gain for the next LEGIC Prime exchanges.
+ * @brief Select the receiver gain for LEGIC Prime exchanges.
  *
- * @param[in] reduced true for reduced gain (retry setting), false for full gain.
+ * Takes effect with the next frame sent by the poller's tx() (not with a
+ * frame queued by furi_hal_nfc_legic_poller_set_next()).
+ *
+ * @param[in] reduced true for the default first-stage gain reduction, false for full gain.
  */
 void furi_hal_nfc_legic_poller_set_rx_reduced_gain(bool reduced);
 

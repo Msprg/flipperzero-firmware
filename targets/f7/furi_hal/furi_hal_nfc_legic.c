@@ -90,14 +90,15 @@
 #define LEGIC_RX_MAX_SEGMENTS (16U)
 #define LEGIC_RX_WINDOW_CHIPS (LEGIC_TAG_FRAME_WAIT_CHIPS + 23U * LEGIC_TAG_BIT_CHIPS + 40U)
 
-// First-stage AM gain reduction (RX_CONF3 rg1_am = 4) used on read retries;
-// see furi_hal_nfc_legic_common_init for the RX tuning history.
-#define LEGIC_RX_CONF3_RETRY (0x80U)
-// Poller first-stage AM gain reduction, rg1_am = 2.  Full gain lost runs of a
-// strong tag (PM3 `hf legic sim`: 43% clean reads, all missed '1's); rg1_am
-// 1/2/3/4/5/6 gave 91/95/93/83/76/61%.  A real MIM256 reads 97-98% clean
-// at both rg1_am 0 and 4.
+// Poller first-stage AM gain reduction, rg1_am = 2 (the default, "reduced
+// gain").  Full gain lost runs of a strong tag (PM3 `hf legic sim`: 43%
+// clean reads, all missed '1's); rg1_am 1/2/3/4/5/6 gave 91/95/93/83/76/61%.
+// A real MIM256 reads 97-98% clean at both rg1_am 0 and 4.  A more weakly
+// coupled simulator lost the card-type reply at rg1_am 2 but not at full
+// gain, so the poller alternates the two after failures
+// (furi_hal_nfc_legic_poller_set_rx_reduced_gain).
 #define LEGIC_RX_CONF3_POLLER (0x40U)
+#define LEGIC_RX_CONF3_FULL   (0x00U)
 
 // Per-exchange debug records (LegicDbgRec), written to LEGIC_RX_DBG_LOG_PATH
 // at deinit.
@@ -323,7 +324,8 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_init(const FuriHalSpiBusHandle*
 
     FuriHalNfcLegicPoller* instance = furi_hal_nfc_legic_poller;
     st25r3916_write_reg(handle, ST25R3916_REG_RX_CONF3, LEGIC_RX_CONF3_POLLER);
-    instance->rx_gain_applied = false;
+    instance->rx_reduced_gain = true;
+    instance->rx_gain_applied = true;
     instance->dbg_recs = malloc(sizeof(LegicDbgRec) * LEGIC_DBG_RECS);
     instance->dbg_claim_us = -1;
     instance->dbg_next_entry_us = INT16_MIN;
@@ -509,7 +511,7 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_tx(
         st25r3916_write_reg(
             handle,
             ST25R3916_REG_RX_CONF3,
-            instance->rx_reduced_gain ? LEGIC_RX_CONF3_RETRY : LEGIC_RX_CONF3_POLLER);
+            instance->rx_reduced_gain ? LEGIC_RX_CONF3_POLLER : LEGIC_RX_CONF3_FULL);
         instance->rx_gain_applied = instance->rx_reduced_gain;
     }
 

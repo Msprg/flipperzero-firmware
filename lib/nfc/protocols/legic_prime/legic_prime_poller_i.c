@@ -32,8 +32,9 @@ static LegicPrimeError legic_prime_poller_map_nfc_error(NfcError err) {
  * aim 250 µs + k * 99.1 µs past the reference (±50 µs of margin), with k as
  * small as the software latency allows, and forward k more steps.
  */
-// Failed reads allowed per byte (CRC errors or disagreeing reads); failed
-// bytes are retried in later passes.
+// Failed reads allowed per byte and session (CRC errors or disagreeing
+// reads).  Each resumed session starts afresh, so a byte that ran out of
+// attempts is not lost for good; the resume limit bounds the total.
 #define LEGIC_PRIME_READ_ATTEMPTS (6U)
 
 static uint8_t legic_prime_type_code(LegicPrimeType type) {
@@ -218,6 +219,7 @@ LegicPrimeError legic_prime_poller_read(LegicPrimePoller* instance) {
     furi_assert(instance);
     furi_assert(instance->data->data_size <= LEGIC_PRIME_MEM_MAX);
 
+    memset(instance->attempts, 0, sizeof(instance->attempts));
     uint16_t addr;
     if(!legic_prime_poller_next_addr(instance, instance->data->data_size - 1, &addr)) {
         return instance->done_count == instance->data->data_size ? LegicPrimeErrorNone :

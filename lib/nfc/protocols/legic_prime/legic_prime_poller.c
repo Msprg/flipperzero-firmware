@@ -2,6 +2,7 @@
 #include "legic_prime_poller_i.h"
 
 #include <nfc/protocols/nfc_poller_base.h>
+#include <furi_hal_nfc.h>
 
 #define TAG "LegicPrimePoller"
 
@@ -55,17 +56,37 @@ static void legic_prime_poller_set_callback(
     instance->context = context;
 }
 
+// Handshakes tried before reporting a failure: one misdecoded card-type
+// reply should not end a read.
+#define LEGIC_PRIME_SETUP_ATTEMPTS (3U)
+
+// The HAL's default receiver gain suits strongly coupled tags; a weakly
+// coupled one can need full gain.  Alternate the two after a failed
+// handshake or a read session that made no progress.  The gain is applied
+// with the session's first frame (the IV).
+static void legic_prime_poller_apply_gain(LegicPrimePoller* instance) {
+    furi_hal_nfc_legic_poller_set_rx_reduced_gain(!instance->rx_full_gain);
+}
+
 static NfcCommand legic_prime_poller_setup_handler(LegicPrimePoller* instance) {
     // IV value matches Proxmark3's default (cmdhflegic.c). The LEGIC PRNG
     // requires IV to be odd; 0x55 is the empirically-known working value.
+    legic_prime_poller_apply_gain(instance);
     LegicPrimeError err = legic_prime_poller_setup(instance, 0x55);
-    if(err != LegicPrimeErrorNone) {
+    NfcCommand command = NfcCommandContinue;
+    if(err == LegicPrimeErrorNone) {
+        instance->setup_attempts = 0;
+        instance->state = LegicPrimePollerStateRequestMode;
+    } else if(++instance->setup_attempts < LEGIC_PRIME_SETUP_ATTEMPTS) {
+        instance->rx_full_gain = !instance->rx_full_gain;
+        // The tag is waiting for an ACK; start over from a fresh field.
+        command = NfcCommandReset;
+    } else {
+        instance->setup_attempts = 0;
         instance->state = LegicPrimePollerStateFailure;
         instance->legic_event_data.error = err;
-    } else {
-        instance->state = LegicPrimePollerStateRequestMode;
     }
-    return NfcCommandContinue;
+    return command;
 }
 
 static NfcCommand legic_prime_poller_request_mode_handler(LegicPrimePoller* instance) {
@@ -75,7 +96,6 @@ static NfcCommand legic_prime_poller_request_mode_handler(LegicPrimePoller* inst
     instance->state = LegicPrimePollerStateRead;
     memset(instance->done, 0, sizeof(instance->done));
     memset(instance->seen, 0, sizeof(instance->seen));
-    memset(instance->attempts, 0, sizeof(instance->attempts));
     instance->done_count = 0;
     instance->resume_done = 0;
     instance->resumes = 0;
@@ -90,7 +110,12 @@ static NfcCommand legic_prime_poller_request_mode_handler(LegicPrimePoller* inst
 
 static NfcCommand legic_prime_poller_read_handler(LegicPrimePoller* instance) {
     NfcCommand command = NfcCommandContinue;
+    const uint16_t done_before = instance->done_count;
+    legic_prime_poller_apply_gain(instance);
     LegicPrimeError err = legic_prime_poller_read(instance);
+    if(err != LegicPrimeErrorNone && instance->done_count == done_before) {
+        instance->rx_full_gain = !instance->rx_full_gain;
+    }
     // Only resumes that make no progress count against the limit.
     if(instance->done_count != instance->resume_done) {
         instance->resume_done = instance->done_count;
@@ -161,8 +186,10 @@ static bool legic_prime_poller_detect(NfcGenericEvent event, void* context) {
 
     bool detected = false;
     if(nfc_event->type == NfcEventTypePollerReady) {
+        legic_prime_poller_apply_gain(instance);
         LegicPrimeError err = legic_prime_poller_setup(instance, 0x55);
         detected = (err == LegicPrimeErrorNone);
+        if(!detected) instance->rx_full_gain = !instance->rx_full_gain;
     }
     return detected;
 }

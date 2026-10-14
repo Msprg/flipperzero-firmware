@@ -59,6 +59,8 @@ struct LegicPrimePoller {
     uint16_t done_count;
     uint16_t resume_done; // done_count at the last resume
     uint8_t resumes; // field resets since the read last made progress
+    uint8_t setup_attempts; // failed handshakes in a row
+    bool rx_full_gain; // receiver gain for the next handshake or session
 
     NfcGenericEvent general_event;
     LegicPrimePollerEvent legic_event;
