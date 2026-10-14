@@ -38,6 +38,11 @@
 #define TAG "FuriHalLegic"
 
 #define LEGIC_RX_DBG_LOG_PATH "/ext/legic_rx_dbg.log"
+// DEBUG: the per-exchange records and their log are only kept when this file
+// exists and the heap can spare them (not inside the NFC app, whose scanner
+// creates the poller on every poll cycle).
+#define LEGIC_DBG_FLAG_PATH   "/ext/legic_dbg"
+#define LEGIC_DBG_HEAP_MARGIN (12U * 1024U)
 
 #define FURI_HAL_NFC_LEGIC_POLLER_MAX_BUFFER_SIZE (16U)
 #define FURI_HAL_NFC_LEGIC_FIFO_SIZE              (512U)
@@ -290,12 +295,6 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_init(const FuriHalSpiBusHandle*
     furi_hal_nfc_legic_poller = malloc(sizeof(FuriHalNfcLegicPoller));
     memset(furi_hal_nfc_legic_poller, 0, sizeof(FuriHalNfcLegicPoller));
 
-    furi_hal_nfc_legic_poller->dbg_storage = furi_record_open(RECORD_STORAGE);
-    furi_hal_nfc_legic_poller->dbg_rx_file =
-        storage_file_alloc(furi_hal_nfc_legic_poller->dbg_storage);
-    storage_file_open(
-        furi_hal_nfc_legic_poller->dbg_rx_file, LEGIC_RX_DBG_LOG_PATH, FSAM_WRITE, FSOM_OPEN_APPEND);
-
     // Subcarrier-stream mode + OOK: FIFO chip-bits are OOK-modulated directly
     // on TX, and RX demodulates a 212 kHz subcarrier into the FIFO.
     st25r3916_change_reg_bits(
@@ -326,7 +325,17 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_init(const FuriHalSpiBusHandle*
     st25r3916_write_reg(handle, ST25R3916_REG_RX_CONF3, LEGIC_RX_CONF3_POLLER);
     instance->rx_reduced_gain = true;
     instance->rx_gain_applied = true;
-    instance->dbg_recs = malloc(sizeof(LegicDbgRec) * LEGIC_DBG_RECS);
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(storage_common_exists(storage, LEGIC_DBG_FLAG_PATH) &&
+       memmgr_get_free_heap() > sizeof(LegicDbgRec) * LEGIC_DBG_RECS + LEGIC_DBG_HEAP_MARGIN) {
+        instance->dbg_storage = storage;
+        instance->dbg_rx_file = storage_file_alloc(storage);
+        storage_file_open(
+            instance->dbg_rx_file, LEGIC_RX_DBG_LOG_PATH, FSAM_WRITE, FSOM_OPEN_APPEND);
+        instance->dbg_recs = malloc(sizeof(LegicDbgRec) * LEGIC_DBG_RECS);
+    } else {
+        furi_record_close(RECORD_STORAGE);
+    }
     instance->dbg_claim_us = -1;
     instance->dbg_next_entry_us = INT16_MIN;
     return err;
