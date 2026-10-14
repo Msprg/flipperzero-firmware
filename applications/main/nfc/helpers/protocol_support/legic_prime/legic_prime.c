@@ -18,10 +18,22 @@ static void nfc_scene_info_on_enter_legic_prime(NfcApp* instance) {
         temp_str, "\e#%s\n", nfc_device_get_name(device, NfcDeviceNameTypeFull));
     nfc_render_legic_prime_info(data, NfcProtocolFormatTypeFull, temp_str);
 
+    widget_reset(instance->widget);
     widget_add_text_scroll_element(
         instance->widget, 0, 0, 128, 64, furi_string_get_cstr(temp_str));
 
     furi_string_free(temp_str);
+}
+
+static void nfc_scene_more_info_on_enter_legic_prime(NfcApp* instance) {
+    const NfcDevice* device = instance->nfc_device;
+    const LegicPrimeData* data = nfc_device_get_data(device, NfcProtocolLegicPrime);
+
+    furi_string_reset(instance->text_box_store);
+    nfc_render_legic_prime_dump(data, instance->text_box_store);
+
+    widget_add_text_scroll_element(
+        instance->widget, 0, 0, 128, 64, furi_string_get_cstr(instance->text_box_store));
 }
 
 static NfcCommand nfc_scene_read_poller_callback_legic_prime(NfcGenericEvent event, void* context) {
@@ -60,12 +72,32 @@ static void nfc_scene_read_success_on_enter_legic_prime(NfcApp* instance) {
     furi_string_free(temp_str);
 }
 
+static NfcCommand
+    nfc_scene_emulate_listener_callback_legic_prime(NfcGenericEvent event, void* context) {
+    UNUSED(event);
+    UNUSED(context);
+    return NfcCommandContinue;
+}
+
+static void nfc_scene_emulate_on_enter_legic_prime(NfcApp* instance) {
+    const LegicPrimeData* data = nfc_device_get_data(instance->nfc_device, NfcProtocolLegicPrime);
+
+    instance->listener = nfc_listener_alloc(instance->nfc, NfcProtocolLegicPrime, data);
+    nfc_listener_start(
+        instance->listener, nfc_scene_emulate_listener_callback_legic_prime, instance);
+}
+
 const NfcProtocolSupportBase nfc_protocol_support_legic_prime = {
-    .features = NfcProtocolFeatureNone,
+    .features = NfcProtocolFeatureEmulateFull | NfcProtocolFeatureMoreInfo,
 
     .scene_info =
         {
             .on_enter = nfc_scene_info_on_enter_legic_prime,
+            .on_event = nfc_protocol_support_common_on_event_empty,
+        },
+    .scene_more_info =
+        {
+            .on_enter = nfc_scene_more_info_on_enter_legic_prime,
             .on_event = nfc_protocol_support_common_on_event_empty,
         },
     .scene_read =
@@ -95,7 +127,7 @@ const NfcProtocolSupportBase nfc_protocol_support_legic_prime = {
         },
     .scene_emulate =
         {
-            .on_enter = nfc_protocol_support_common_on_enter_empty,
+            .on_enter = nfc_scene_emulate_on_enter_legic_prime,
             .on_event = nfc_protocol_support_common_on_event_empty,
         },
 };

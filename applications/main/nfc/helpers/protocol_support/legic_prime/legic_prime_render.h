@@ -8,3 +8,5 @@ void nfc_render_legic_prime_info(
     const LegicPrimeData* data,
     NfcProtocolFormatType format_type,
     FuriString* str);
+
+void nfc_render_legic_prime_dump(const LegicPrimeData* data, FuriString* str);

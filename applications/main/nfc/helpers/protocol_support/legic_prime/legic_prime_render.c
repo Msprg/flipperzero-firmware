@@ -23,14 +23,13 @@ void nfc_render_legic_prime_info(
 
     if(format_type == NfcProtocolFormatTypeFull) {
         furi_string_cat_printf(str, "\nMemory: %u bytes", (unsigned)data->data_size);
-        furi_string_cat_printf(str, "\n:::::::::::::::[Data]:::::::::::::::");
-        size_t shown = data->data_size > 64 ? 64 : data->data_size;
-        for(size_t i = 0; i < shown; i++) {
-            if((i & 7) == 0) furi_string_cat_printf(str, "\n%03X:", (unsigned)i);
-            furi_string_cat_printf(str, " %02X", data->data[i]);
-        }
-        if(shown < data->data_size) {
-            furi_string_cat_printf(str, "\n...");
-        }
+    }
+}
+
+void nfc_render_legic_prime_dump(const LegicPrimeData* data, FuriString* str) {
+    // The font escape applies to one line only.
+    for(size_t i = 0; i < data->data_size; i++) {
+        if((i % 4) == 0) furi_string_cat_printf(str, "%s\e*%03X:", i ? "\n" : "", (unsigned)i);
+        furi_string_cat_printf(str, " %02X", data->data[i]);
     }
 }
