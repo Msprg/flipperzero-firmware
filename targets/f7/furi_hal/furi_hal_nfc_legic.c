@@ -14,13 +14,13 @@
  *  - The tag advances its keystream every 99.1 µs while idle, so frames are
  *    scheduled at exact times chosen by the poller (see set_tx_start).
  *
- * RX uses the chip's subcarrier-stream receiver (scf_sc212, scp_4): each
- * FIFO bit reports subcarrier presence over ~9.44 µs.  A reception ends
- * ~20 µs into the first '0' bit and the receiver does not re-arm by itself,
- * so one reply arrives as one reception per run of '1' bits.  The receiver
- * is re-armed after each one, and the runs are placed into 99.1 µs bit
- * windows by their start time.  AGC and dynamic squelch are off: with them
- * on, later runs in a reply fade out.
+ * RX uses the chip's subcarrier-stream receiver (scf_sc212, scp_8): each
+ * FIFO bit reports subcarrier presence over ~18.9 µs.  A reception may end
+ * in a '0' bit and the receiver does not re-arm by itself, so one reply
+ * arrives as one or more receptions.  The receiver is re-armed after each
+ * one, and the FIFO bits are placed into 99.1 µs bit windows by the
+ * reception start time.  AGC and dynamic squelch are off: with them on,
+ * later runs in a reply fade out.
  *
  * References:
  *  - Proxmark3 armsrc/legicrf.c (reader), armsrc/legicrfsim.c (tag side)
@@ -37,7 +37,6 @@
 
 #define TAG "FuriHalLegic"
 
-#define LEGIC_TX_DBG_LOG_PATH "/ext/legic_tx_dbg.log"
 #define LEGIC_RX_DBG_LOG_PATH "/ext/legic_rx_dbg.log"
 
 #define FURI_HAL_NFC_LEGIC_POLLER_MAX_BUFFER_SIZE (16U)
@@ -77,8 +76,13 @@
 #define LEGIC_CHAIN_GAP_CHIPS (47U)
 // With a frame queued, stop the reception this long after the reply should
 // have ended (its length is known) instead of waiting for the receiver to
-// notice the subcarrier is gone, so the queued frame can go out on time.
-#define LEGIC_RX_FORCE_END_US (30U)
+// notice the subcarrier is gone (~125 µs after it stops), so the queued frame
+// can go out on time.  Stopping drops the chip's last partial FIFO byte;
+// 45 µs gave fewer missed final '1' bits than 30 µs (MIM256 card at ~1 cm:
+// 95-96% vs 93-94% clean reads) with the same worst-case send_next entry
+// (~113 µs of the 215 µs budget); at 90 µs the receiver's own end of
+// reception pushed every queued frame past its slot.
+#define LEGIC_RX_FORCE_END_US (45U)
 // Longest wait for TxEnd before giving up on it (longest frame ~1.5 ms).
 #define LEGIC_TXE_MAX_WAIT_MS (10U)
 
@@ -89,11 +93,36 @@
 // First-stage AM gain reduction (RX_CONF3 rg1_am = 4) used on read retries;
 // see furi_hal_nfc_legic_common_init for the RX tuning history.
 #define LEGIC_RX_CONF3_RETRY (0x80U)
+// Poller first-stage AM gain reduction, rg1_am = 2.  Full gain lost runs of a
+// strong tag (PM3 `hf legic sim`: 43% clean reads, all missed '1's); rg1_am
+// 1/2/3/4/5/6 gave 91/95/93/83/76/61%.  A real MIM256 reads 97-98% clean
+// at both rg1_am 0 and 4.
+#define LEGIC_RX_CONF3_POLLER (0x40U)
 
-// Per-exchange RX debug log.  Formatted in rx(), after the queued next frame
-// (if any) has already gone out.
+// Per-exchange debug records (LegicDbgRec), written to LEGIC_RX_DBG_LOG_PATH
+// at deinit.
 #define LEGIC_DBG_RX_LOG (1)
 
+
+#define LEGIC_DBG_RECS     (512U)
+#define LEGIC_DBG_REC_SEGS (6U)
+typedef struct {
+    uint32_t t_ms;
+    uint32_t dec;
+    int16_t claim_us; // queued frame claimed by tx(), µs after its TRANSMIT; -1: sent by tx()
+    int16_t next_entry_us; // send_next() entry after this reply's end; INT16_MIN: none
+    int16_t txe_late_us;
+    uint8_t tx_bits;
+    uint8_t want;
+    uint8_t got;
+    uint8_t seg_count;
+    int16_t seg_s[LEGIC_DBG_REC_SEGS];
+    int16_t seg_e[LEGIC_DBG_REC_SEGS];
+    uint8_t seg_bits[LEGIC_DBG_REC_SEGS];
+    uint8_t seg_off[LEGIC_DBG_REC_SEGS];
+    uint8_t raw_len;
+    uint8_t raw[28];
+} LegicDbgRec;
 
 typedef struct {
     uint8_t frame_buf[FURI_HAL_NFC_LEGIC_POLLER_MAX_BUFFER_SIZE * 4];
@@ -143,18 +172,16 @@ typedef struct {
     uint32_t seg_t_rxe[LEGIC_RX_MAX_SEGMENTS];
     uint16_t seg_bits[LEGIC_RX_MAX_SEGMENTS];
     uint16_t seg_off[LEGIC_RX_MAX_SEGMENTS];
-    // Debug instrumentation: per-TX/RX records buffered in RAM and written to
-    // SD only between exchanges (an SD write blocks the thread for up to
-    // several ms, which wrecks event timestamps if it happens mid-exchange).
-    char dbg_tx_buf[8192];
-    size_t dbg_tx_len;
-    char dbg_rx_buf[12288];
-    size_t dbg_rx_len;
+    // DEBUG instrumentation: one binary record per exchange, formatted and
+    // written to SD only at deinit (formatting text mid-session delayed the
+    // thread past the next reply's start; SD writes stall it for ms).
+    LegicDbgRec* dbg_recs;
+    uint32_t dbg_rec_count;
+    int16_t dbg_claim_us;
+    int16_t dbg_next_entry_us;
+    uint8_t dbg_tx_bits;
     Storage* dbg_storage;
-    File* dbg_tx_file;
     File* dbg_rx_file;
-    uint32_t dbg_tx_seq;
-    uint32_t dbg_rx_seq;
 } FuriHalNfcLegicPoller;
 
 static FuriHalNfcLegicPoller* furi_hal_nfc_legic_poller = NULL;
@@ -169,14 +196,57 @@ static int32_t legic_cycles_to_us(int32_t cycles) {
 }
 
 static void legic_dbg_flush(FuriHalNfcLegicPoller* instance) {
-    if(instance->dbg_tx_len && instance->dbg_tx_file && storage_file_is_open(instance->dbg_tx_file)) {
-        storage_file_write(instance->dbg_tx_file, instance->dbg_tx_buf, instance->dbg_tx_len);
+    File* f = instance->dbg_rx_file;
+    if(!instance->dbg_recs || !f || !storage_file_is_open(f)) return;
+    char line[600];
+    int n = snprintf(
+        line,
+        sizeof(line),
+        "session recs=%lu late=%lu txe_missing=%lu\n",
+        (unsigned long)instance->dbg_rec_count,
+        (unsigned long)instance->next_late,
+        (unsigned long)instance->txe_missing);
+    storage_file_write(f, line, n);
+    const uint32_t first =
+        instance->dbg_rec_count > LEGIC_DBG_RECS ? instance->dbg_rec_count - LEGIC_DBG_RECS : 0;
+    for(uint32_t r = first; r < instance->dbg_rec_count; r++) {
+        const LegicDbgRec* rec = &instance->dbg_recs[r % LEGIC_DBG_RECS];
+        n = snprintf(
+            line,
+            sizeof(line),
+            "rx#%lu tx_bits=%u claim_us=%d next_entry_us=%d want=%u got=%u txe_late_us=%d"
+            " segs=%u t_ms=%lu",
+            (unsigned long)r,
+            rec->tx_bits,
+            rec->claim_us,
+            rec->next_entry_us,
+            rec->want,
+            rec->got,
+            rec->txe_late_us,
+            rec->seg_count,
+            (unsigned long)rec->t_ms);
+        for(size_t i = 0; i < rec->seg_count && i < LEGIC_DBG_REC_SEGS; i++) {
+            n += snprintf(
+                line + n,
+                sizeof(line) - n,
+                " [%d..%d %ub @%u]",
+                rec->seg_s[i],
+                rec->seg_e[i],
+                rec->seg_bits[i],
+                rec->seg_off[i]);
+        }
+        n += snprintf(line + n, sizeof(line) - n, " raw:");
+        for(size_t i = 0; i < rec->raw_len; i++) {
+            n += snprintf(line + n, sizeof(line) - n, " %02X", rec->raw[i]);
+        }
+        n += snprintf(line + n, sizeof(line) - n, " dec:");
+        for(size_t k = 0; k < rec->got && k < 32; k++) {
+            line[n++] = (rec->dec >> k) & 1u ? '1' : '0';
+        }
+        line[n++] = '\n';
+        storage_file_write(f, line, n);
     }
-    if(instance->dbg_rx_len && instance->dbg_rx_file && storage_file_is_open(instance->dbg_rx_file)) {
-        storage_file_write(instance->dbg_rx_file, instance->dbg_rx_buf, instance->dbg_rx_len);
-    }
-    instance->dbg_tx_len = 0;
-    instance->dbg_rx_len = 0;
+    instance->dbg_rec_count = 0;
 }
 
 static FuriHalNfcError furi_hal_nfc_legic_common_init(const FuriHalSpiBusHandle* handle) {
@@ -188,6 +258,10 @@ static FuriHalNfcError furi_hal_nfc_legic_common_init(const FuriHalSpiBusHandle*
     //    FIFO bits.  12/200 kHz (or 60/400 kHz) + scp_8: 16/16 correct.
     //  - against the much stronger PM3 `hf legic sim`, lp_300khz + 12/80 kHz
     //    + scp_4 was the setting that worked (600 kHz LPF cut long runs).
+    //    Re-checked 2026-10-14 with scp_8 and no debug formatting in the RX
+    //    path: lp_300khz/lp_2000khz lose the real tag's runs after ~75 µs,
+    //    lp_600khz/lp_1200khz read it; the sim needs the poller's first-stage
+    //    gain reduction instead (LEGIC_RX_CONF3_POLLER).
     //  - AGC (any mode) and dynamic squelch made runs fade or vanish; the PM
     //    channel and CORR_CONF1=0x00 cut runs after 8 FIFO bits.
     st25r3916_write_reg(
@@ -216,10 +290,6 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_init(const FuriHalSpiBusHandle*
     memset(furi_hal_nfc_legic_poller, 0, sizeof(FuriHalNfcLegicPoller));
 
     furi_hal_nfc_legic_poller->dbg_storage = furi_record_open(RECORD_STORAGE);
-    furi_hal_nfc_legic_poller->dbg_tx_file =
-        storage_file_alloc(furi_hal_nfc_legic_poller->dbg_storage);
-    storage_file_open(
-        furi_hal_nfc_legic_poller->dbg_tx_file, LEGIC_TX_DBG_LOG_PATH, FSAM_WRITE, FSOM_OPEN_APPEND);
     furi_hal_nfc_legic_poller->dbg_rx_file =
         storage_file_alloc(furi_hal_nfc_legic_poller->dbg_storage);
     storage_file_open(
@@ -249,7 +319,15 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_init(const FuriHalSpiBusHandle*
         ST25R3916_REG_AUX_MOD,
         ST25R3916_REG_AUX_MOD_dis_reg_am | ST25R3916_REG_AUX_MOD_res_am);
 
-    return furi_hal_nfc_legic_common_init(handle);
+    FuriHalNfcError err = furi_hal_nfc_legic_common_init(handle);
+
+    FuriHalNfcLegicPoller* instance = furi_hal_nfc_legic_poller;
+    st25r3916_write_reg(handle, ST25R3916_REG_RX_CONF3, LEGIC_RX_CONF3_POLLER);
+    instance->rx_gain_applied = false;
+    instance->dbg_recs = malloc(sizeof(LegicDbgRec) * LEGIC_DBG_RECS);
+    instance->dbg_claim_us = -1;
+    instance->dbg_next_entry_us = INT16_MIN;
+    return err;
 }
 
 static FuriHalNfcError furi_hal_nfc_legic_poller_deinit(const FuriHalSpiBusHandle* handle) {
@@ -257,10 +335,6 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_deinit(const FuriHalSpiBusHandl
     furi_check(furi_hal_nfc_legic_poller);
 
     legic_dbg_flush(furi_hal_nfc_legic_poller);
-    if(furi_hal_nfc_legic_poller->dbg_tx_file) {
-        storage_file_close(furi_hal_nfc_legic_poller->dbg_tx_file);
-        storage_file_free(furi_hal_nfc_legic_poller->dbg_tx_file);
-    }
     if(furi_hal_nfc_legic_poller->dbg_rx_file) {
         storage_file_close(furi_hal_nfc_legic_poller->dbg_rx_file);
         storage_file_free(furi_hal_nfc_legic_poller->dbg_rx_file);
@@ -269,6 +343,7 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_deinit(const FuriHalSpiBusHandl
         furi_record_close(RECORD_STORAGE);
     }
 
+    free(furi_hal_nfc_legic_poller->dbg_recs);
     free(furi_hal_nfc_legic_poller);
     furi_hal_nfc_legic_poller = NULL;
     return FuriHalNfcErrorNone;
@@ -408,21 +483,8 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_tx(
         instance->synth_txe = instance->next_txe_seen;
         instance->txe_pending = !instance->next_txe_seen;
         instance->next_txe_seen = false;
-        if(sizeof(instance->dbg_tx_buf) - instance->dbg_tx_len > 160) {
-            int n = snprintf(
-                instance->dbg_tx_buf + instance->dbg_tx_len,
-                sizeof(instance->dbg_tx_buf) - instance->dbg_tx_len,
-                "tx#%lu queued legic_bits=%u rx_bits=%u late=%lu txe_missing=%lu t_ms=%lu\n",
-                (unsigned long)(instance->dbg_tx_seq++),
-                (unsigned)tx_bits,
-                (unsigned)instance->rx_bits_expected,
-                (unsigned long)instance->next_late,
-                (unsigned long)instance->txe_missing,
-                (unsigned long)furi_get_tick());
-            if(n > 0 && (size_t)n < sizeof(instance->dbg_tx_buf) - instance->dbg_tx_len) {
-                instance->dbg_tx_len += n;
-            }
-        }
+        instance->dbg_claim_us = legic_cycles_to_us(t_entry - instance->next_tx_cmd);
+        instance->dbg_tx_bits = tx_bits;
         return FuriHalNfcErrorNone;
     }
     // A frame queued with set_next() before this tx() stays queued: it goes
@@ -447,7 +509,7 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_tx(
         st25r3916_write_reg(
             handle,
             ST25R3916_REG_RX_CONF3,
-            instance->rx_reduced_gain ? LEGIC_RX_CONF3_RETRY : 0x00);
+            instance->rx_reduced_gain ? LEGIC_RX_CONF3_RETRY : LEGIC_RX_CONF3_POLLER);
         instance->rx_gain_applied = instance->rx_reduced_gain;
     }
 
@@ -489,27 +551,8 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_tx(
     instance->t_frame_end = instance->t_tx_cmd + cmd_latency + legic_chips_to_cycles(w.bit_pos);
     instance->tx_pad_chips = instance->frame_buf_bits - w.bit_pos;
 
-    if(sizeof(instance->dbg_tx_buf) - instance->dbg_tx_len > 160) {
-        char* line = instance->dbg_tx_buf + instance->dbg_tx_len;
-        const size_t size = sizeof(instance->dbg_tx_buf) - instance->dbg_tx_len;
-        int n = snprintf(
-            line,
-            size,
-            "tx#%lu legic_bits=%u chip_bits=%u prep_us=%ld wait_us=%ld rx_bits=%u t_ms=%lu in:",
-            (unsigned long)(instance->dbg_tx_seq++),
-            (unsigned)tx_bits,
-            (unsigned)w.bit_pos,
-            (long)instance->tx_prep_us,
-            (long)instance->tx_wait_us,
-            (unsigned)instance->rx_bits_expected,
-            (unsigned long)furi_get_tick());
-        size_t in_bytes = (tx_bits + 7) / 8;
-        for(size_t i = 0; i < in_bytes && n + 4 < (int)size; i++) {
-            n += snprintf(line + n, size - n, " %02X", tx_data[i]);
-        }
-        n += snprintf(line + n, size - n, "\n");
-        if(n > 0 && (size_t)n < size) instance->dbg_tx_len += n;
-    }
+    instance->dbg_claim_us = -1;
+    instance->dbg_tx_bits = tx_bits;
 
     return FuriHalNfcErrorNone;
 }
@@ -575,23 +618,9 @@ static void furi_hal_nfc_legic_send_next(FuriHalNfcLegicPoller* instance) {
     st25r3916_direct_cmd(handle, ST25R3916_CMD_STOP);
     st25r3916_direct_cmd(handle, ST25R3916_CMD_CLEAR_FIFO);
     st25r3916_write_fifo(handle, instance->next_buf, fifo_bits);
-    const int32_t ready_us = legic_cycles_to_us(DWT->CYCCNT - reply_end);
     const bool late = (int32_t)(cmd_at - DWT->CYCCNT) <= 0;
 
-    if(sizeof(instance->dbg_tx_buf) - instance->dbg_tx_len > 160) {
-        int n = snprintf(
-            instance->dbg_tx_buf + instance->dbg_tx_len,
-            sizeof(instance->dbg_tx_buf) - instance->dbg_tx_len,
-            "next chips=%u after_reply_end: entry_us=%ld fifo_ready_us=%ld cmd_at_us=%ld%s\n",
-            (unsigned)instance->next_chip_bits,
-            (long)entry_us,
-            (long)ready_us,
-            (long)legic_cycles_to_us(cmd_at - reply_end),
-            late ? " LATE" : "");
-        if(n > 0 && (size_t)n < sizeof(instance->dbg_tx_buf) - instance->dbg_tx_len) {
-            instance->dbg_tx_len += n;
-        }
-    }
+    instance->dbg_next_entry_us = entry_us;
 
     if(late) {
         // Too late: the tag would read it in the wrong keystream slot.
@@ -767,54 +796,35 @@ static FuriHalNfcError furi_hal_nfc_legic_poller_rx(
     size_t max_bits = instance->rx_bits_expected ? instance->rx_bits_expected : 23U;
     *rx_bits = furi_hal_nfc_legic_decode(instance, rx_data, rx_data_size, max_bits);
 
-    if(LEGIC_DBG_RX_LOG) {
-        // No SD writes mid-session (they stall the thread for tens of ms and
-        // a queued frame misses its slot): wrap around and keep the latest.
-        if(sizeof(instance->dbg_rx_buf) - instance->dbg_rx_len < 600) instance->dbg_rx_len = 0;
-        if(sizeof(instance->dbg_tx_buf) - instance->dbg_tx_len < 400) instance->dbg_tx_len = 0;
+    if(LEGIC_DBG_RX_LOG && instance->dbg_recs) {
+        LegicDbgRec* rec = &instance->dbg_recs[instance->dbg_rec_count++ % LEGIC_DBG_RECS];
         const uint32_t t0 =
             instance->t_frame_end + legic_chips_to_cycles(LEGIC_TAG_FRAME_WAIT_CHIPS);
-        char line[600];
-        int n = snprintf(
-            line,
-            sizeof(line),
-            "rx#%lu reduced_gain=%u want=%u got=%u txe_late_us=%ld cmd_to_txe_us=%ld segs=%u t_ms=%lu",
-            (unsigned long)(instance->dbg_rx_seq++),
-            instance->rx_reduced_gain,
-            (unsigned)instance->rx_bits_expected,
-            (unsigned)*rx_bits,
-            (long)legic_cycles_to_us(
-                instance->t_txe - instance->t_frame_end -
-                legic_chips_to_cycles(instance->tx_pad_chips)),
-            (long)legic_cycles_to_us(instance->t_txe - instance->t_tx_cmd),
-            (unsigned)instance->seg_count,
-            (unsigned long)furi_get_tick());
-        // Per segment: start/end µs relative to the expected reply start (t0).
-        for(size_t i = 0; i < instance->seg_count && n + 40 < (int)sizeof(line); i++) {
-            n += snprintf(
-                line + n,
-                sizeof(line) - n,
-                " [%ld..%ld %ub]",
-                (long)legic_cycles_to_us(instance->seg_t_rxs[i] - t0),
-                (long)legic_cycles_to_us(instance->seg_t_rxe[i] - t0),
-                (unsigned)instance->seg_bits[i]);
+        rec->t_ms = furi_get_tick();
+        rec->tx_bits = instance->dbg_tx_bits;
+        rec->claim_us = instance->dbg_claim_us;
+        rec->next_entry_us = instance->dbg_next_entry_us;
+        instance->dbg_next_entry_us = INT16_MIN;
+        rec->want = instance->rx_bits_expected;
+        rec->got = *rx_bits;
+        rec->txe_late_us = legic_cycles_to_us(
+            instance->t_txe - instance->t_frame_end -
+            legic_chips_to_cycles(instance->tx_pad_chips));
+        rec->dec = 0;
+        for(size_t k = 0; k < *rx_bits && k < 32; k++) {
+            rec->dec |= (uint32_t)((rx_data[k / 8] >> (k % 8)) & 1u) << k;
         }
-        n += snprintf(line + n, sizeof(line) - n, " raw:");
-        size_t bytes = (instance->fifo_buf_bits + 7) / BITS_IN_BYTE;
-        for(size_t i = 0; i < bytes && n + 4 < (int)sizeof(line); i++) {
-            n += snprintf(line + n, sizeof(line) - n, " %02X", instance->fifo_buf[i]);
+        rec->seg_count = instance->seg_count;
+        for(size_t i = 0; i < instance->seg_count && i < LEGIC_DBG_REC_SEGS; i++) {
+            rec->seg_s[i] = legic_cycles_to_us(instance->seg_t_rxs[i] - t0);
+            rec->seg_e[i] = legic_cycles_to_us(instance->seg_t_rxe[i] - t0);
+            rec->seg_bits[i] = instance->seg_bits[i];
+            rec->seg_off[i] = instance->seg_off[i];
         }
-        n += snprintf(line + n, sizeof(line) - n, " dec:");
-        for(size_t k = 0; k < *rx_bits && n + 3 < (int)sizeof(line); k++) {
-            n += snprintf(
-                line + n, sizeof(line) - n, "%u", (rx_data[k / 8] >> (k % 8)) & 1u);
-        }
-        n += snprintf(line + n, sizeof(line) - n, "\n");
-        if(n > 0 && (size_t)n < sizeof(line) &&
-           instance->dbg_rx_len + n <= sizeof(instance->dbg_rx_buf)) {
-            memcpy(instance->dbg_rx_buf + instance->dbg_rx_len, line, n);
-            instance->dbg_rx_len += n;
-        }
+        size_t raw_len = (instance->fifo_buf_bits + 7) / BITS_IN_BYTE;
+        if(raw_len > sizeof(rec->raw)) raw_len = sizeof(rec->raw);
+        memcpy(rec->raw, instance->fifo_buf, raw_len);
+        rec->raw_len = raw_len;
     }
 
     return FuriHalNfcErrorNone;
