@@ -942,6 +942,14 @@ static FuriHalNfcError furi_hal_nfc_legic_listener_init(const FuriHalSpiBusHandl
     st25r3916_change_reg_bits(
         handle, ST25R3916_REG_MODE, ST25R3916_REG_MODE_targ, ST25R3916_REG_MODE_targ_targ);
     FuriHalNfcError error = furi_hal_nfc_legic_common_init(handle);
+    // The reader pauses reach the IRQ pin through the RX filter.  The
+    // emulator's pause timing (and so its reply timing) was tuned with the
+    // 300 kHz LPF and 12/80 kHz zeros; the poller's filter broke replies.
+    st25r3916_write_reg(
+        handle,
+        ST25R3916_REG_RX_CONF1,
+        ST25R3916_REG_RX_CONF1_z12k | ST25R3916_REG_RX_CONF1_h80 |
+            ST25R3916_REG_RX_CONF1_lp_300khz);
 
     // Transparent mode: IRQ pin = demodulated field, MOSI = load modulation.
     st25r3916_direct_cmd(handle, ST25R3916_CMD_TRANSPARENT_MODE);

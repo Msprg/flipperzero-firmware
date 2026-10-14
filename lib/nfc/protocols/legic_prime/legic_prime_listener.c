@@ -22,6 +22,12 @@
 #define LEGIC_PRIME_LISTENER_TICK_CHIPS (1U) // 64/fc, 4.72 µs
 #define LEGIC_PRIME_LISTENER_BIT_CHIPS  (21U) // 99.1 µs
 #define LEGIC_PRIME_LISTENER_MAX_BITS   (24U)
+// A real tag loses power when the reader's field goes off, which ends its
+// session.  The field isn't monitored here, so a frame this long after the
+// last exchange starts a new session instead; catching the keystream up over
+// a gap of seconds would also take far longer than the 330 µs reply slot.
+// (Readers continue a session within a few hundred µs.)
+#define LEGIC_PRIME_LISTENER_SESSION_GAP_US (20000U)
 
 typedef enum {
     LegicPrimeListenerStateIdle, // waiting for IV
@@ -146,6 +152,12 @@ static NfcCommand legic_prime_listener_run(NfcGenericEvent event, void* context)
 
     const BitBuffer* rx = nfc_event->data.buffer;
     const size_t bits = bit_buffer_get_size(rx);
+
+    const uint32_t gap = furi_hal_nfc_legic_listener_get_frame_start() - instance->ref;
+    if(instance->state != LegicPrimeListenerStateIdle &&
+       gap > LEGIC_PRIME_LISTENER_SESSION_GAP_US * furi_hal_cortex_instructions_per_microsecond()) {
+        instance->state = LegicPrimeListenerStateIdle;
+    }
 
     if(instance->state == LegicPrimeListenerStateIdle) {
         legic_prime_listener_handle_iv(instance, rx, bits);
